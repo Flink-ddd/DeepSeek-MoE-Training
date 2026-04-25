@@ -47,6 +47,9 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_retro_args(parser)
     parser = _add_profiler_args(parser)
 
+    # 添加 DeepSeek MoE 专项参数加载
+    parser = _add_deepseek_moe_args(parser)
+
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
@@ -1585,4 +1588,19 @@ def _add_profiler_args(parser):
      default=None,
      help="Which ranks to profile. Format: 0 1 2 3")
 
+    return parser
+
+
+def _add_deepseek_moe_args(parser):
+    group = parser.add_argument_group(title='DeepSeek MoE')
+    group.add_argument('--is-deepseek-moe', action='store_true',
+                       help='Enable DeepSeek MoE architecture.')
+    group.add_argument('--num-shared-experts', type=int, default=1,
+                       help='Number of shared experts that are always active.')
+    group.add_argument('--shared-expert-intermediate-size', type=int, default=None,
+                       help='Intermediate FFN size for the shared experts.')
+    group.add_argument('--routed-expert-intermediate-size', type=int, default=None,
+                       help='Intermediate FFN size for each routed expert.')
+    group.add_argument('--moe-layer-freq', type=int, default=1,
+                       help='The frequency of MoE layers in the transformer block.')
     return parser

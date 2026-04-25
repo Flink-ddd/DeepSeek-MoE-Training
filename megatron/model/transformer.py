@@ -234,6 +234,61 @@ class SwitchMLP(MegatronModule):
         return output_total, output_bias_total
 
 
+class DeepSeekMoE(MegatronModule):
+    """
+    实现 DeepSeek MoE 架构：始终激活的共享专家 (Shared Experts) + 动态路由专家 (Routed Experts)
+    """
+    def __init__(self, config):
+        super(DeepSeekMoE, self).__init__()
+        args = get_args()
+        import copy
+
+        # 1. 共享专家 (Shared Experts) - 稠密计算路径
+        # DeepSeek 的设计是让共享专家捕获通用知识。
+        shared_config = copy.deepcopy(config)
+        if args.shared_expert_intermediate_size is not None:
+            shared_config.ffn_hidden_size = args.shared_expert_intermediate_size
+        self.shared_experts = ParallelMLP(shared_config)
+
+        # 2. 路由专家 (Routed Experts) - 稀疏计算路径 (Expert Parallel)
+        # 我们直接集成 DeepSpeed 的 MoE 层，它已经封装好了高性能的 All-to-All 通信。
+        routed_config = copy.deepcopy(config)
+        if args.routed_expert_intermediate_size is not None:
+            routed_config.ffn_hidden_size = args.routed_expert_intermediate_size
+
+        # 获取路由专家的总数（通常是 args.num_experts 列表中的第一个值）
+        num_routed_experts = args.num_experts[0] if isinstance(args.num_experts, list) else args.num_experts
+
+        self.routed_experts = MoE(
+            args.hidden_size,
+            ParallelMLP(routed_config, moe=True, 
+                        enable_expert_tensor_parallelism=args.enable_expert_tensor_parallelism),
+            num_experts=num_routed_experts,
+            ep_size=args.moe_expert_parallel_size,
+            k=args.topk,
+            use_residual=False, # 重要：DeepSeek 靠共享专家提供基础输出，不依赖标准残差
+            capacity_factor=args.moe_train_capacity_factor,
+            eval_capacity_factor=args.moe_eval_capacity_factor,
+            min_capacity=args.moe_min_capacity,
+            drop_tokens=args.moe_token_dropping,
+            use_tutel=args.use_tutel,
+            enable_expert_tensor_parallelism=args.enable_expert_tensor_parallelism,
+            top2_2nd_expert_sampling=args.moe_top2_2nd_expert_sampling
+        )
+
+    def forward(self, hidden_states):
+        # 路径 A: 共享专家 (Dense Path)
+        shared_output, shared_bias = self.shared_experts(hidden_states)
+        if shared_bias is not None:
+            shared_output = shared_output + shared_bias
+            
+        # 路径 B: 路由专家 (Sparse Path) -> 这里会触发分布式 All-to-All 通信
+        routed_output, moe_loss, _ = self.routed_experts(hidden_states)
+        
+        # DeepSeek 核心公式：结果 = 共享专家输出 + 路由专家输出
+        # 注意：返回 3 个值以保持与 ParallelTransformerLayer 的接口兼容
+        return shared_output + routed_output, moe_loss, None
+
 class CoreAttention(MegatronModule):
 
     def __init__(self, layer_number, config,
@@ -1072,6 +1127,8 @@ class ParallelTransformerLayer(MegatronModule):
         self.num_experts = num_experts
         if args.num_experts_switch is not None:
             self.mlp = SwitchMLP(config) # Megatron-LM's MoE
+        elif args.is_deepseek_moe:
+            self.mlp = DeepSeekMoE(config) # DeepSeek's MoE
         else:
             if self.num_experts <= 1: # dense, not MoE
                 self.mlp = ParallelMLP(config)
